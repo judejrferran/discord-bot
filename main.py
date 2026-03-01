@@ -1,134 +1,120 @@
 import discord
 from discord.ext import commands
+import json
+import random
 import os
-from datetime import datetime
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
+intents.messages = True
+intents.dm_messages = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+@bot.command()
+@commands.is_owner()
+async def say(ctx, *, message):
+    await ctx.send(message)
 
-# ====== YOU MUST SET THESE ======
-CONTROL_LOG_CHANNEL_ID = 1467326504420642961  # your join-logs channel ID
-AUTO_ROLE_NAME = "Member"
-UNVERIFIED_ROLE_NAME = "Unverified"
-VERIFIED_ROLE_NAME = "Verified"
+# === CONFIG ===
+ADMIN_GUILD_ID = 1467325897890595102  # Your admin server ID
+JOIN_LOGS_CHANNEL_ID = 1467326504420642961  # join_logs
+CONVOS_CHANNEL_ID = 1477597698902458569  # convos
+VERIFIED_USERS_FILE = "verified_users.json"
 
-# suspicious account settings
-SUSPICIOUS_ACCOUNT_DAYS = 7   # < 7 days old = suspicious
+# Multiple sequential questions for verification
+VERIFICATION_QUESTIONS = [
+    {"question": "What color is the sky?", "answer": "blue"},
+    {"question": "What is 2 + 2?", "answer": "4"},
+    {"question": "Type 'I am human'", "answer": "i am human"}
+]
 
-# ====== BOT START ======
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is online.")
+# Load verified users
+if os.path.exists(VERIFIED_USERS_FILE):
+    with open(VERIFIED_USERS_FILE, "r") as f:
+        verified_users = json.load(f)
+else:
+    verified_users = {}
 
-# ====== JOIN EVENT ======
+def save_verified_users():
+    with open(VERIFIED_USERS_FILE, "w") as f:
+        json.dump(verified_users, f)
+
+# === EVENTS ===
+
 @bot.event
 async def on_member_join(member):
-    guild = member.guild
+    """Trigger when a new member joins any server."""
+    try:
+        # Start sequential verification
+        verified_users[str(member.id)] = {
+            "verified": False,
+            "current_q": 0,  # Track which question
+            "answers": []
+        }
+        save_verified_users()
+        await send_next_question(member)
+    except Exception as e:
+        print(f"Could not DM {member.name}: {e}")
 
-    # ---- account age ----
-    account_age_days = (datetime.utcnow() - member.created_at).days
-    suspicious = account_age_days < SUSPICIOUS_ACCOUNT_DAYS
+    # Log join in join_logs
+    admin_guild = bot.get_guild(ADMIN_GUILD_ID)
+    join_channel = admin_guild.get_channel(JOIN_LOGS_CHANNEL_ID)
+    await join_channel.send(f"New member joined: {member.name}#{member.discriminator}")
 
-    # ---- Auto-role ----
-    role = discord.utils.get(guild.roles, name=AUTO_ROLE_NAME)
-    if role:
-        try:
-            await member.add_roles(role)
-        except:
-            pass
+async def send_next_question(member):
+    """Send the next verification question."""
+    user_data = verified_users.get(str(member.id))
+    if not user_data:
+        return
 
-    # ---- Private logging to YOUR control server ----
-    control_log_channel = bot.get_channel(CONTROL_LOG_CHANNEL_ID)
-    if control_log_channel:
-        await control_log_channel.send(
-            f"📥 **New Join**\n"
-            f"Server: **{guild.name}**\n"
-            f"User: {member} \n"
-            f"User ID: {member.id}\n"
-            f"Account age: **{account_age_days} days**\n"
-            f"Suspicious: {'⚠️ YES' if suspicious else 'No'}"
-        )
+    current_q = user_data["current_q"]
+    if current_q >= len(VERIFICATION_QUESTIONS):
+        # All questions answered
+        user_data["verified"] = True
+        save_verified_users()
+        await member.send("✅ Verification complete! You can now interact in servers.")
+        return
 
-    # ---- Server mod warning (only if suspicious) ----
-    if suspicious:
-        mod_logs = discord.utils.get(guild.text_channels, name="mod-logs")
-        if mod_logs:
-            await mod_logs.send(
-                f"⚠️ **Suspicious new account joined**\n"
-                f"User: {member.mention}\n"
-                f"Account age: **{account_age_days} days** (threshold: {SUSPICIOUS_ACCOUNT_DAYS})"
-            )
+    question = VERIFICATION_QUESTIONS[current_q]["question"]
+    await member.send(f"Question {current_q + 1}: {question}")
 
-# ====== ADMIN SETUP COMMAND ======
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup(ctx):
-    guild = ctx.guild
+@bot.event
+async def on_message(message):
+    """Handle DMs for sequential verification and block unverified users."""
+    if message.author == bot.user:
+        return  # Ignore bot messages
 
-    # Create roles if missing
-    for role_name in [AUTO_ROLE_NAME, UNVERIFIED_ROLE_NAME, VERIFIED_ROLE_NAME]:
-        if not discord.utils.get(guild.roles, name=role_name):
-            await guild.create_role(name=role_name)
+    # --- DM VERIFICATION ---
+    if isinstance(message.channel, discord.DMChannel):
+        await message.add_reaction("✅")  # Auto-react
+        admin_guild = bot.get_guild(ADMIN_GUILD_ID)
+        convos_channel = admin_guild.get_channel(CONVOS_CHANNEL_ID)
+        await convos_channel.send(f"DM from {message.author.name}#{message.author.discriminator}: {message.content}")
 
-    # Create mod-logs channel if missing
-    if not discord.utils.get(guild.text_channels, name="mod-logs"):
-        await guild.create_text_channel("mod-logs")
+        user_data = verified_users.get(str(message.author.id))
+        if user_data and not user_data["verified"]:
+            current_q = user_data["current_q"]
+            correct_answer = VERIFICATION_QUESTIONS[current_q]["answer"].lower()
+            if message.content.lower().strip() == correct_answer:
+                user_data["answers"].append(message.content)
+                user_data["current_q"] += 1
+                save_verified_users()
+                await send_next_question(message.author)
+            else:
+                await message.channel.send("❌ Incorrect answer. Try again.")
 
-    await ctx.send("✅ Setup complete: roles + #mod-logs created.")
+    # --- BLOCK UNVERIFIED USERS IN SERVERS ---
+    elif message.guild:
+        user_data = verified_users.get(str(message.author.id))
+        if not user_data or not user_data.get("verified", False):
+            try:
+                await message.delete()
+                await message.author.send("You must verify via DM before interacting in servers!")
+            except:
+                print(f"Couldn't delete message or DM {message.author.name}")
 
-# ====== VERIFY COMMAND ======
-@bot.command()
-async def verify(ctx):
-    guild = ctx.guild
-    unverified = discord.utils.get(guild.roles, name=UNVERIFIED_ROLE_NAME)
-    verified = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+    await bot.process_commands(message)
 
-    if verified:
-        try:
-            await ctx.author.add_roles(verified)
-        except:
-            await ctx.send("❌ I can't assign roles. Please move my bot role above Verified.")
-            return
-
-    if unverified:
-        try:
-            await ctx.author.remove_roles(unverified)
-        except:
-            pass
-
-    await ctx.send("✅ You are now verified!")
-
-# ====== PRIVACY COMMAND ======
-@bot.command()
-async def privacy(ctx):
-    await ctx.send(
-        "**🔒 Privacy & Data Policy**\n"
-        "This bot is an onboarding + security utility bot.\n\n"
-        "**What it DOES collect:**\n"
-        "• Join events (username, user ID, server name)\n"
-        "• Account age (days since account creation)\n\n"
-        "**What it DOES NOT collect:**\n"
-        "• Message contents\n"
-        "• DMs\n"
-        "• Voice activity\n"
-        "• Friend list or private user data\n\n"
-        "**Why it collects join data:**\n"
-        "• To help server admins detect raids / spam accounts\n\n"
-        "**Removal:**\n"
-        "Admins can remove the bot anytime from Server Settings → Integrations."
-    )
-
-# ====== HELP COMMAND ======
-@bot.command()
-async def helpme(ctx):
-    await ctx.send(
-        "**Commands:**\n"
-        "`!setup` (admin only) - creates roles + mod logs channel\n"
-        "`!verify` - gives Verified role\n"
-        "`!privacy` - shows privacy policy\n"
-        "`!helpme` - shows commands"
-    )
-
-bot.run(os.getenv("DISCORD_TOKEN"))
+bot.run("DISCORD_TOKEN")
