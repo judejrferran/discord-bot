@@ -1,120 +1,117 @@
 import discord
-from discord.ext import commands
-import json
-import random
+from datetime import datetime, timezone
 import os
+import requests
+from async_tls_client import AsyncClient  # TLS spoofing library
 
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.messages = True
-intents.dm_messages = True
-intents.guilds = True
+# Custom HTTPClient with TLS/browser spoofing to bypass Cloudflare blocks
+class CustomHTTP(discord.http.HTTPClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Spoof modern Chrome TLS fingerprint (update to latest supported, e.g., "chrome126" if available)
+        self.tls_client = AsyncClient(
+            client_identifier="chrome124",          # Try "chrome126" or check library for newest
+            random_tls_extension_order=True,
+            # Optional: Add residential proxy if still blocked (format: http://user:pass@ip:port)
+            # proxy="http://your-proxy-here",
+        )
+        # Force a real browser User-Agent to match the spoof (helps consistency)
+        self.user_agent_header = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-@bot.command()
-@commands.is_owner()
-async def say(ctx, *, message):
-    await ctx.send(message)
+    async def request(self, route, *, files=None, form=None, **kwargs):
+        method = route.method
+        url = str(route)
+        headers = kwargs.pop('headers', {})
+        headers.update(self.user_agent_header)   # Consistent UA
+        headers.update(self.token_header)        # Auth token
+        params = kwargs.pop('params', None)
+        data = kwargs.pop('data', None)
+        json = kwargs.pop('json', None)
+        if form:
+            data = form  # Multipart support
 
-# === CONFIG ===
-ADMIN_GUILD_ID = 1467325897890595102  # Your admin server ID
-JOIN_LOGS_CHANNEL_ID = 1467326504420642961  # join_logs
-CONVOS_CHANNEL_ID = 1477597698902458569  # convos
-VERIFIED_USERS_FILE = "verified_users.json"
+        try:
+            response = await self.tls_client.execute(
+                method=method.lower(),
+                url=url,
+                headers=headers,
+                params=params,
+                data=data,
+                json=json,
+                files=files,                  # Better file handling
+                follow_redirects=True
+            )
+        except Exception as e:
+            print(f"TLS spoofed request failed: {e}")
+            raise
 
-# Multiple sequential questions for verification
-VERIFICATION_QUESTIONS = [
-    {"question": "What color is the sky?", "answer": "blue"},
-    {"question": "What is 2 + 2?", "answer": "4"},
-    {"question": "Type 'I am human'", "answer": "i am human"}
-]
+        # Proper async-compatible response wrapper
+        class DummyResponse:
+            def __init__(self, resp):
+                self.status = resp.status_code
+                self.reason = resp.reason_phrase or ""
+                self.headers = resp.headers
+                self._resp = resp  # Keep original for async methods
 
-# Load verified users
-if os.path.exists(VERIFIED_USERS_FILE):
-    with open(VERIFIED_USERS_FILE, "r") as f:
-        verified_users = json.load(f)
-else:
-    verified_users = {}
+            async def text(self):
+                return await self._resp.text()   # Assume async; if sync, use asyncio.to_thread
 
-def save_verified_users():
-    with open(VERIFIED_USERS_FILE, "w") as f:
-        json.dump(verified_users, f)
+            async def json(self):
+                return await self._resp.json()
 
-# === EVENTS ===
+            async def read(self):
+                return await self._resp.read()
 
-@bot.event
-async def on_member_join(member):
-    """Trigger when a new member joins any server."""
+        return DummyResponse(response)
+
+# Setup the selfbot client
+client = discord.Client(self_bot=True)
+client.http = CustomHTTP()  # Use our spoofed HTTP client
+
+webhook_url = os.getenv("WEBHOOK_URL")
+
+def send_webhook_message(content):
+    if not webhook_url:
+        print("Webhook URL missing – set WEBHOOK_URL in Railway variables")
+        return
+    
     try:
-        # Start sequential verification
-        verified_users[str(member.id)] = {
-            "verified": False,
-            "current_q": 0,  # Track which question
-            "answers": []
-        }
-        save_verified_users()
-        await send_next_question(member)
+        data = {"content": content}
+        response = requests.post(webhook_url, json=data)
+        if response.status_code != 204:
+            print(f"Webhook send failed: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"Could not DM {member.name}: {e}")
+        print(f"Webhook error: {e}")
 
-    # Log join in join_logs
-    admin_guild = bot.get_guild(ADMIN_GUILD_ID)
-    join_channel = admin_guild.get_channel(JOIN_LOGS_CHANNEL_ID)
-    await join_channel.send(f"New member joined: {member.name}#{member.discriminator}")
+@client.event
+async def on_ready():
+    print(f'Logged in as {client.user} (ID: {client.user.id})')
+    print('Selfbot is ready and connected!')
 
-async def send_next_question(member):
-    """Send the next verification question."""
-    user_data = verified_users.get(str(member.id))
-    if not user_data:
-        return
+@client.event
+async def on_member_join(member):
+    try:
+        guild = member.guild
+        account_age = (datetime.now(timezone.utc) - member.created_at).days
+        
+        message = (
+            f"📥 **New Join Detected**\n"
+            f"Server: **{guild.name}**\n"
+            f"User: {member.name} ({member})\n"
+            f"User ID: {member.id}\n"
+            f"Account Age: {account_age} days"
+        )
+        
+        send_webhook_message(message)
+        print(f"Webhook sent for join: {member.name}")
+    except Exception as e:
+        print(f"on_member_join error: {e}")
 
-    current_q = user_data["current_q"]
-    if current_q >= len(VERIFICATION_QUESTIONS):
-        # All questions answered
-        user_data["verified"] = True
-        save_verified_users()
-        await member.send("✅ Verification complete! You can now interact in servers.")
-        return
+# Token check
+user_token = os.environ.get("DISCORD_TOKEN")
+if not user_token:
+    print("DISCORD_TOKEN is missing! Set it in Railway Variables.")
+    raise ValueError("DISCORD_TOKEN required")
 
-    question = VERIFICATION_QUESTIONS[current_q]["question"]
-    await member.send(f"Question {current_q + 1}: {question}")
-
-@bot.event
-async def on_message(message):
-    """Handle DMs for sequential verification and block unverified users."""
-    if message.author == bot.user:
-        return  # Ignore bot messages
-
-    # --- DM VERIFICATION ---
-    if isinstance(message.channel, discord.DMChannel):
-        await message.add_reaction("✅")  # Auto-react
-        admin_guild = bot.get_guild(ADMIN_GUILD_ID)
-        convos_channel = admin_guild.get_channel(CONVOS_CHANNEL_ID)
-        await convos_channel.send(f"DM from {message.author.name}#{message.author.discriminator}: {message.content}")
-
-        user_data = verified_users.get(str(message.author.id))
-        if user_data and not user_data["verified"]:
-            current_q = user_data["current_q"]
-            correct_answer = VERIFICATION_QUESTIONS[current_q]["answer"].lower()
-            if message.content.lower().strip() == correct_answer:
-                user_data["answers"].append(message.content)
-                user_data["current_q"] += 1
-                save_verified_users()
-                await send_next_question(message.author)
-            else:
-                await message.channel.send("❌ Incorrect answer. Try again.")
-
-    # --- BLOCK UNVERIFIED USERS IN SERVERS ---
-    elif message.guild:
-        user_data = verified_users.get(str(message.author.id))
-        if not user_data or not user_data.get("verified", False):
-            try:
-                await message.delete()
-                await message.author.send("You must verify via DM before interacting in servers!")
-            except:
-                print(f"Couldn't delete message or DM {message.author.name}")
-
-    await bot.process_commands(message)
-
-bot.run(os.getenv("DISCORD_TOKEN"))
+print("Starting selfbot with TLS spoofing...")
+client.run(user_token)
