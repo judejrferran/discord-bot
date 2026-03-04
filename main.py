@@ -10,7 +10,7 @@ class CustomHTTP(discord.http.HTTPClient):
         super().__init__(*args, **kwargs)
         # Spoof modern Chrome TLS fingerprint (update to latest supported, e.g., "chrome126" if available)
         self.tls_client = AsyncClient(
-            client_identifier="chrome124",          # Try "chrome126" or check library for newest
+            client_identifier="chrome133",          # Try "chrome126" or check library for newest
             random_tls_extension_order=True,
             # Optional: Add residential proxy if still blocked (format: http://user:pass@ip:port)
             # proxy="http://your-proxy-here",
@@ -66,6 +66,7 @@ class CustomHTTP(discord.http.HTTPClient):
 
 # Setup the selfbot client
 client = discord.Client(self_bot=True)
+client.ws.heartbeat_timeout = 60  # Increase tolerance for missed heartbeats
 client.http = CustomHTTP()  # Use our spoofed HTTP client
 
 webhook_url = os.getenv("WEBHOOK_URL")
